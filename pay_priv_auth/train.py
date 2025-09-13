@@ -1,93 +1,78 @@
-"""Training script for the logistic baseline."""
+"""Training script for the logistic baseline on real datasets."""
 
 from __future__ import annotations
 
 import argparse
 import pathlib
-from typing import Tuple
+from typing import Dict, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
 
-from .evaluation import compute_auc, compute_eer, compute_far_frr
+from .evaluation import auc_score, eer, far_frr_at, frr_far_at
 from .models.baseline import LogisticBaseline
 
 
-def generate_synthetic_data(n_users: int, n_features: int, samples_per_user: int, seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+def split_by_session(df: pd.DataFrame, seed: int) -> Tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
-    X = []
-    uids = []
-    for u in range(n_users):
-        mean = rng.normal(loc=0.0, scale=1.0, size=n_features)
-        samples = rng.normal(mean, 1.0, size=(samples_per_user, n_features))
-        X.append(samples)
-        uids.extend([u] * samples_per_user)
-    return np.vstack(X), np.array(uids, dtype=int)
+    users = df["user_id"].unique()
+    train_mask = np.zeros(len(df), dtype=bool)
+    for u in users:
+        sess = df[df["user_id"] == u]["session_id"].unique()
+        rng.shuffle(sess)
+        split = int(0.7 * len(sess))
+        train_sessions = set(sess[:split])
+        mask = (df["user_id"] == u) & (df["session_id"].isin(train_sessions))
+        train_mask |= mask
+    test_mask = ~train_mask
+    return train_mask, test_mask
 
 
-def train_model(X: np.ndarray, uids: np.ndarray) -> LogisticBaseline:
-    model = LogisticBaseline(max_iter=200)
-    model.fit(X, uids)
-    return model
-
-
-def evaluate(model: LogisticBaseline, X: np.ndarray, uids: np.ndarray) -> Tuple[float, float, float, float]:
-    scores = []
-    labels = []
+def evaluate(model: LogisticBaseline, X: np.ndarray, uids: np.ndarray) -> Dict[int, Tuple[float, float, float, float]]:
+    metrics: Dict[int, Tuple[float, float, float, float]] = {}
     for uid in np.unique(uids):
         mask_g = uids == uid
-        s_g = model.score_user(int(uid), X[mask_g])
-        s_i = model.score_user(int(uid), X[~mask_g])
-        scores.append(np.concatenate([s_g, s_i]))
-        labels.append(np.concatenate([np.ones_like(s_g), np.zeros_like(s_i)]))
-    scores = np.concatenate(scores)
-    labels = np.concatenate(labels)
-    auc = compute_auc(scores, labels)
-    eer, th, _ = compute_eer(scores, labels)
-    far, frr = compute_far_frr(scores, labels, th)
-    return auc, eer, far, frr
+        scores_g = model.predict_proba_user(int(uid), X[mask_g])
+        scores_i = model.predict_proba_user(int(uid), X[~mask_g])
+        y_true = np.concatenate([np.ones_like(scores_g), np.zeros_like(scores_i)])
+        y_score = np.concatenate([scores_g, scores_i])
+        auc = auc_score(y_true, y_score)
+        eer_v, _ = eer(y_true, y_score)
+        far, _ = far_frr_at(y_true, y_score, 0.05)
+        frr, _ = frr_far_at(y_true, y_score, 0.005)
+        metrics[int(uid)] = (auc, eer_v, far, frr)
+    return metrics
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train logistic baseline")
-    ap.add_argument("--dataset_parquet", type=pathlib.Path, default=None)
-    ap.add_argument("--n_users", type=int, default=5)
-    ap.add_argument("--n_features", type=int, default=20)
-    ap.add_argument("--samples_per_user", type=int, default=200)
-    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--dataset_parquet", type=pathlib.Path, required=True)
+    ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
 
-    if args.dataset_parquet and args.dataset_parquet.exists():
-        df = pd.read_parquet(args.dataset_parquet)
-        feature_cols = [c for c in df.columns if c.startswith("f")]
-        X = df[feature_cols].to_numpy()
-        uids = df["user_id"].to_numpy().astype(int)
-    else:
-        X, uids = generate_synthetic_data(args.n_users, args.n_features, args.samples_per_user, args.seed)
+    df = pd.read_parquet(args.dataset_parquet)
+    feature_cols = [c for c in df.columns if c.startswith("f")]
+    X = df[feature_cols].to_numpy()
+    uid_codes, uniques = pd.factorize(df["user_id"].astype(str))
 
-    # Split into train/test per user
-    rng = np.random.default_rng(args.seed)
-    train_idx = []
-    test_idx = []
-    for uid in np.unique(uids):
-        idx = np.where(uids == uid)[0]
-        rng.shuffle(idx)
-        split = int(0.7 * len(idx))
-        train_idx.extend(idx[:split])
-        test_idx.extend(idx[split:])
-    train_idx = np.array(train_idx)
-    test_idx = np.array(test_idx)
+    train_mask, test_mask = split_by_session(df, args.seed)
+    model = LogisticBaseline(max_iter=200)
+    model.fit(X[train_mask], uid_codes[train_mask])
 
-    model = train_model(X[train_idx], uids[train_idx])
-    auc, eer, far, frr = evaluate(model, X[test_idx], uids[test_idx])
-    print(f"AUC={auc:.3f} EER={eer:.3f} FAR={far:.3f} FRR={frr:.3f}")
+    metrics = evaluate(model, X[test_mask], uid_codes[test_mask])
+    auc = np.mean([m[0] for m in metrics.values()])
+    eer_v = np.mean([m[1] for m in metrics.values()])
+    far = np.mean([m[2] for m in metrics.values()])
+    frr = np.mean([m[3] for m in metrics.values()])
+    print(f"AUC={auc:.3f} EER={eer_v:.3f} FAR@5%FRR={far:.3f} FRR@0.5%FAR={frr:.3f}")
 
-    # Save per-user models
-    out_dir = pathlib.Path("artifacts")
-    out_dir.mkdir(exist_ok=True)
-    for uid, um in model.models.items():
-        joblib.dump(um.model, out_dir / f"user_{uid}_logreg.joblib")
+    dataset_name = args.dataset_parquet.stem.replace("_features", "")
+    out_dir = pathlib.Path("artifacts") / dataset_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for idx, uid in enumerate(uniques):
+        if idx in model.models:
+            joblib.dump(model.models[idx].model, out_dir / f"user_{uid}_logreg.joblib")
 
 
 if __name__ == "__main__":  # pragma: no cover

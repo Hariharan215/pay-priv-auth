@@ -1,32 +1,25 @@
-"""Federated averaging for linear models."""
+"""Model aggregation helpers."""
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from typing import Dict
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 
 
-class FedAvgAggregator:
-    @staticmethod
-    def average(models: Iterable[LogisticRegression], weights: Optional[Iterable[float]] = None) -> LogisticRegression:
-        models = list(models)
-        if not models:
-            raise ValueError("No models provided")
-        if weights is None:
-            weights = [1.0 / len(models)] * len(models)
-        else:
-            weights = list(weights)
-            total = float(sum(weights))
-            weights = [w / total for w in weights]
-        coef = np.zeros_like(models[0].coef_)
-        intercept = np.zeros_like(models[0].intercept_)
-        for w, m in zip(weights, models):
-            coef += w * m.coef_
-            intercept += w * m.intercept_
-        agg = LogisticRegression()
-        agg.classes_ = models[0].classes_.copy()
-        agg.coef_ = coef
-        agg.intercept_ = intercept
-        return agg
+def fedavg_logistic(models_by_user: Dict[int, LogisticRegression]) -> LogisticRegression:
+    """Average logistic regression models via FedAvg."""
+
+    models = [m for m in models_by_user.values() if hasattr(m, "coef_")]
+    if not models:
+        raise ValueError("No models to average")
+    base_shape = models[0].coef_.shape
+    models = [m for m in models if m.coef_.shape == base_shape]
+    coef = np.mean([m.coef_ for m in models], axis=0)
+    intercept = np.mean([m.intercept_ for m in models], axis=0)
+    agg = LogisticRegression()
+    agg.classes_ = models[0].classes_.copy()
+    agg.coef_ = coef
+    agg.intercept_ = intercept
+    return agg

@@ -7,27 +7,44 @@ and coordinate information is used; any textual content is ignored.
 
 from __future__ import annotations
 
-from typing import Iterable, Iterator, List, Tuple
+from typing import Iterator, List, Tuple
 
 import numpy as np
 import pandas as pd
 
 
-def _window_iter(df: pd.DataFrame, win_ms: int, hop_ms: int) -> Iterator[Tuple[pd.DataFrame, float]]:
-    """Yield windows of ``df`` based on the ``t`` column (seconds)."""
+def window_stream(
+    df: pd.DataFrame, win_ms: int, hop_ms: int, t_col: str = "t"
+) -> Iterator[Tuple[pd.DataFrame, float]]:
+    """Yield windows of ``df`` based on the timestamp column.
+
+    Parameters
+    ----------
+    df:
+        Input dataframe containing a timestamp column ``t_col`` measured in
+        seconds.
+    win_ms:
+        Size of the sliding window in milliseconds.
+    hop_ms:
+        Hop between consecutive windows in milliseconds.
+    t_col:
+        Name of the timestamp column.
+    """
+
     if df.empty:
         return iter([])
-    start = float(df["t"].min())
-    end = float(df["t"].max())
+    start = float(df[t_col].min())
+    end = float(df[t_col].max())
     win_s = win_ms / 1000.0
     hop_s = hop_ms / 1000.0
     t = start
     while t <= end:
-        yield df[(df["t"] >= t) & (df["t"] < t + win_s)], t
+        mask = (df[t_col] >= t) & (df[t_col] < t + win_s)
+        yield df[mask], t
         t += hop_s
 
 
-def _keystroke_feats(df: pd.DataFrame) -> np.ndarray:
+def keystroke_features(df: pd.DataFrame) -> np.ndarray:
     if df.empty:
         return np.zeros(8, dtype=float)
     times = df["t"].values
@@ -49,7 +66,7 @@ def _keystroke_feats(df: pd.DataFrame) -> np.ndarray:
     return np.array(feats, dtype=float)
 
 
-def _gesture_feats(df: pd.DataFrame) -> np.ndarray:
+def gesture_features(df: pd.DataFrame) -> np.ndarray:
     if df.empty:
         return np.zeros(10, dtype=float)
     times = df["t"].values
@@ -78,7 +95,7 @@ def _gesture_feats(df: pd.DataFrame) -> np.ndarray:
     return np.array(feats, dtype=float)
 
 
-def _imu_feats(df: pd.DataFrame) -> np.ndarray:
+def imu_features(df: pd.DataFrame) -> np.ndarray:
     if df.empty:
         return np.zeros(12, dtype=float)
     axes = ["ax", "ay", "az", "gx", "gy", "gz"]
@@ -88,6 +105,18 @@ def _imu_feats(df: pd.DataFrame) -> np.ndarray:
         feats.append(float(vals.mean()))
         feats.append(float(vals.std(ddof=0)))
     return np.array(feats, dtype=float)
+
+
+def make_feature_vector(t_win: pd.DataFrame, k_win: pd.DataFrame, i_win: pd.DataFrame) -> np.ndarray:
+    """Concatenate modality features into a single vector."""
+
+    return np.concatenate(
+        [
+            keystroke_features(k_win),
+            gesture_features(t_win),
+            imu_features(i_win),
+        ]
+    )
 
 
 def extract_features(
@@ -101,7 +130,7 @@ def extract_features(
 
     Returns a list of ``(start_t, feature_vector)`` tuples.
     """
-    # Determine global time range
+
     dfs = [df for df in [touch, keys, imu] if not df.empty]
     if not dfs:
         return []
@@ -115,11 +144,7 @@ def extract_features(
         w_touch = touch[(touch["t"] >= t) & (touch["t"] < t + win_s)]
         w_keys = keys[(keys["t"] >= t) & (keys["t"] < t + win_s)]
         w_imu = imu[(imu["t"] >= t) & (imu["t"] < t + win_s)]
-        feats = np.concatenate([
-            _keystroke_feats(w_keys),
-            _gesture_feats(w_touch),
-            _imu_feats(w_imu),
-        ])
+        feats = make_feature_vector(w_touch, w_keys, w_imu)
         out.append((t, feats))
         t += hop_s
     return out

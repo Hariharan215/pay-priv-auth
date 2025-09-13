@@ -1,55 +1,68 @@
-"""End-to-end experiment runner."""
+"""End-to-end experiment runner on real datasets."""
 
 from __future__ import annotations
 
 import argparse
-from typing import Dict
+import pathlib
 
 import numpy as np
+import pandas as pd
 
-from .evaluation import compute_auc, compute_eer
-from .models.aggregator import FedAvgAggregator
+from .evaluation import auc_score, eer, far_frr_at, frr_far_at
+from .models.aggregator import fedavg_logistic
 from .models.baseline import LogisticBaseline
-from .train import generate_synthetic_data
+from .train import split_by_session
+
+
+def compute_metrics(model, X, uids):
+    out = {}
+    for uid in np.unique(uids):
+        mask_g = uids == uid
+        scores_g = model.predict_proba_user(int(uid), X[mask_g]) if hasattr(model, "predict_proba_user") else model.predict_proba(X[mask_g])[:,1]
+        scores_i = model.predict_proba_user(int(uid), X[~mask_g]) if hasattr(model, "predict_proba_user") else model.predict_proba(X[~mask_g])[:,1]
+        y_true = np.concatenate([np.ones_like(scores_g), np.zeros_like(scores_i)])
+        y_score = np.concatenate([scores_g, scores_i])
+        auc = auc_score(y_true, y_score)
+        e, _ = eer(y_true, y_score)
+        far, _ = far_frr_at(y_true, y_score, 0.05)
+        frr, _ = frr_far_at(y_true, y_score, 0.005)
+        out[int(uid)] = (auc, e, far, frr)
+    return out
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Run synthetic experiment")
-    ap.add_argument("--n_users", type=int, default=5)
-    ap.add_argument("--n_features", type=int, default=20)
-    ap.add_argument("--samples_per_user", type=int, default=100)
-    ap.add_argument("--seed", type=int, default=42)
+    ap = argparse.ArgumentParser(description="Run experiment")
+    ap.add_argument("--dataset_parquet", type=pathlib.Path, required=True)
     ap.add_argument("--use_fedavg", action="store_true")
-    ap.add_argument("--dp_noise", type=float, default=0.0, help="Std dev of Gaussian noise added to scores")
+    ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
 
-    X, uids = generate_synthetic_data(args.n_users, args.n_features, args.samples_per_user, args.seed)
-    rng = np.random.default_rng(args.seed)
-    idx = np.arange(len(uids))
-    rng.shuffle(idx)
-    split = int(0.8 * len(idx))
-    train_idx, test_idx = idx[:split], idx[split:]
-    X_train, X_test = X[train_idx], X[test_idx]
-    uids_train, uids_test = uids[train_idx], uids[test_idx]
+    df = pd.read_parquet(args.dataset_parquet)
+    feature_cols = [c for c in df.columns if c.startswith("f")]
+    X = df[feature_cols].to_numpy()
+    uid_codes, uniques = pd.factorize(df["user_id"].astype(str))
+    train_mask, test_mask = split_by_session(df, args.seed)
 
     baseline = LogisticBaseline(max_iter=200)
-    baseline.fit(X_train, uids_train)
+    baseline.fit(X[train_mask], uid_codes[train_mask])
+
+    metrics_per_user = compute_metrics(baseline, X[test_mask], uid_codes[test_mask])
+    print("user,AUC,EER,FAR@5%FRR,FRR@0.5%FAR")
+    for idx, vals in metrics_per_user.items():
+        print(f"{uniques[idx]},{vals[0]:.3f},{vals[1]:.3f},{vals[2]:.3f},{vals[3]:.3f}")
 
     if args.use_fedavg:
-        agg = FedAvgAggregator()
-        global_model = agg.average([um.model for um in baseline.models.values()])
-        scores = global_model.predict_proba(X_test)[:, 1]
-        labels = (uids_test == 0).astype(int)
-    else:
-        scores = baseline.score_user(0, X_test)
-        labels = (uids_test == 0).astype(int)
-
-    if args.dp_noise > 0:
-        scores = scores + rng.normal(0.0, args.dp_noise, size=scores.shape)
-
-    auc = compute_auc(scores, labels)
-    eer, th, _ = compute_eer(scores, labels)
-    print(f"AUC={auc:.3f} EER={eer:.3f} threshold={th:.3f}")
+        global_model = fedavg_logistic({uid: um.model for uid, um in baseline.models.items()})
+        # wrap global_model to reuse compute_metrics
+        class Wrapper:
+            def __init__(self, model):
+                self.model = model
+            def predict_proba_user(self, user_id, X):
+                return self.model.predict_proba(X)[:,1]
+        global_metrics = compute_metrics(Wrapper(global_model), X[test_mask], uid_codes[test_mask])
+        print("global,", end="")
+        gm_vals = np.mean(list(global_metrics.values()), axis=0)
+        print(f"{gm_vals[0]:.3f},{gm_vals[1]:.3f},{gm_vals[2]:.3f},{gm_vals[3]:.3f}")
 
 
 if __name__ == "__main__":  # pragma: no cover

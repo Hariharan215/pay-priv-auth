@@ -8,23 +8,39 @@ import numpy as np
 from sklearn import metrics
 
 
-def compute_auc(scores: np.ndarray, labels: np.ndarray) -> float:
-    fpr, tpr, _ = metrics.roc_curve(labels, scores)
-    return metrics.auc(fpr, tpr)
+def auc_score(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Compute the area under the ROC curve."""
+
+    return float(metrics.roc_auc_score(y_true, y_score))
 
 
-def compute_eer(scores: np.ndarray, labels: np.ndarray) -> Tuple[float, float, float]:
-    fpr, tpr, thresh = metrics.roc_curve(labels, scores)
+def eer(y_true: np.ndarray, y_score: np.ndarray) -> Tuple[float, float]:
+    """Return the equal error rate and corresponding threshold."""
+
+    fpr, tpr, thresh = metrics.roc_curve(y_true, y_score)
     fnr = 1 - tpr
     idx = int(np.nanargmin(np.abs(fpr - fnr)))
-    eer = (fpr[idx] + fnr[idx]) / 2
-    return float(eer), float(thresh[idx]), float(fpr[idx])
+    eer_val = (fpr[idx] + fnr[idx]) / 2
+    return float(eer_val), float(thresh[idx])
 
 
-def compute_far_frr(scores: np.ndarray, labels: np.ndarray, threshold: float) -> Tuple[float, float]:
-    preds = scores >= threshold
-    genuine = labels == 1
-    impostor = labels == 0
-    far = float(np.sum(preds[impostor])) / max(1, np.sum(impostor))
-    frr = float(np.sum(~preds[genuine])) / max(1, np.sum(genuine))
-    return far, frr
+def far_frr_at(
+    y_true: np.ndarray, y_score: np.ndarray, target_frr: float
+) -> Tuple[float, float]:
+    """FAR at a desired FRR."""
+
+    fpr, tpr, thresh = metrics.roc_curve(y_true, y_score)
+    frr = 1 - tpr
+    idx = int(np.nanargmin(np.abs(frr - target_frr)))
+    return float(fpr[idx]), float(thresh[idx])
+
+
+def frr_far_at(
+    y_true: np.ndarray, y_score: np.ndarray, target_far: float
+) -> Tuple[float, float]:
+    """FRR at a desired FAR."""
+
+    fpr, tpr, thresh = metrics.roc_curve(y_true, y_score)
+    frr = 1 - tpr
+    idx = int(np.nanargmin(np.abs(fpr - target_far)))
+    return float(frr[idx]), float(thresh[idx])

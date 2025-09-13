@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Iterable
 
+import joblib
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 
@@ -41,7 +43,27 @@ class LogisticBaseline:
             self.models[int(uid)] = UserModel(model=clf, positive_class=int(uid))
         return self
 
-    def score_user(self, user_id: int, X: np.ndarray) -> np.ndarray:
+    def predict_proba_user(self, user_id: int, X: np.ndarray) -> np.ndarray:
+        """Return positive-class probabilities for ``user_id``."""
+
         if user_id not in self.models:
             raise ValueError(f"No model for user {user_id}")
         return self.models[user_id].score(X)
+
+    score_user = predict_proba_user  # backwards compatibility
+
+    def save(self, dirpath: Path) -> None:
+        dir = Path(dirpath)
+        dir.mkdir(parents=True, exist_ok=True)
+        for uid, um in self.models.items():
+            joblib.dump(um.model, dir / f"user_{uid}_logreg.joblib")
+
+    @classmethod
+    def load(cls, dirpath: Path) -> "LogisticBaseline":
+        dir = Path(dirpath)
+        inst = cls()
+        for f in dir.glob("user_*_logreg.joblib"):
+            uid = int(f.stem.split("_")[1])
+            model = joblib.load(f)
+            inst.models[uid] = UserModel(model=model, positive_class=uid)
+        return inst
